@@ -1,0 +1,34 @@
+histogram rgw_ops_latency_seconds buckets 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10
+histogram rgw_op_latency_seconds buckets 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 by op
+counter rgw_ops_status_total by status, http_status
+counter rgw_op_status_total by status, http_status, op
+
+histogram rgw_beast_latency_seconds buckets 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 by verb
+histogram rgw_beast_content_length_bytes buckets 0, 1024, 2048, 4096, 16384, 32768, 65536, 1048576, 4194304, 33554432, 134217728, 1073741824 by verb
+counter rgw_beast_ops_total by verb, http_status
+counter rgw_beast_user_agents_total by verb, http_status, user_agent
+counter rgw_beast_addr_total by verb, http_status, addr
+
+
+# reef era without op=..
+/====== req done req=\S+ op status=(?P<status>-?\d+) http_status=(?P<http_status>\d+) latency=(?P<latency>\d+\.\d+)s/ {
+   rgw_ops_latency_seconds = float($latency)
+   rgw_ops_status_total[$status][$http_status]++
+}
+
+
+/====== req done req=\S+ op=(?P<op>\S+).*status=(?P<status>-?\d+) http_status=(?P<http_status>\d+) latency=(?P<latency>\d+\.\d+)s/ {
+   rgw_ops_latency_seconds = float($latency)
+   rgw_ops_status_total[$status][$http_status]++
+
+   rgw_op_latency_seconds[$op] = float($latency)
+   rgw_op_status_total[$status][$http_status][$op]++
+}
+
+/beast: \S+: (?P<addr>\S+) - \S+ .* \\?"(?P<verb>[A-Z]+) \S+ \S+\\?" (?P<http_status>\d+) (?P<content_length>\d+) - \\?"(?P<user_agent>[^"\\]*)\\?" - latency=(?P<latency>\d+\.\d+)s/ {
+   rgw_beast_latency_seconds[$verb] = float($latency)
+   rgw_beast_content_length_bytes[$verb] = int($content_length)
+   rgw_beast_ops_total[$verb][$http_status]++
+   rgw_beast_user_agents_total[$verb][$http_status][$user_agent]++
+   rgw_beast_addr_total[$verb][$http_status][$addr]++
+}

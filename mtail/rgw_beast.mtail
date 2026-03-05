@@ -1,0 +1,12 @@
+counter rgw_beast_requests_total by method, status, user_agent
+counter rgw_beast_response_bytes_total by method, status
+histogram rgw_beast_request_latency_seconds buckets 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 by method, status
+
+# Tails RGW container logs for "beast: ..." access lines. The `\\?` before
+# each quote handles both CRI (literal `"`) and docker json-file (escaped
+# `\"`) kubelet log wrappings.
+/beast: 0x[0-9a-f]+: \S+ - \S+ \[[^\]]+\] \\?"(?P<method>[A-Z]+) \S+ HTTP\/[0-9.]+\\?" (?P<status>\d+) (?P<bytes>\d+) - \\?"(?P<user_agent>[^"\\]*)\\?" - latency=(?P<latency>[0-9.]+)/ {
+    rgw_beast_requests_total[$method][$status][$user_agent]++
+    rgw_beast_response_bytes_total[$method][$status] += $bytes
+    rgw_beast_request_latency_seconds[$method][$status] = $latency
+}
