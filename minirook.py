@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import platform
+import re
 import subprocess
 import sys
 import tempfile
@@ -173,6 +174,9 @@ PROMETHEUS_LOCAL_PORT = 9090
 GRAFANA_LOCAL_PORT = 3000
 CEPH_DASHBOARD_TAG = "v19.2.4"
 CEPH_DASHBOARDS = ("ceph-cluster-advanced", "radosgw-overview", "radosgw-detail")
+# Drop *.json Grafana dashboards here and they are auto-deployed with the monitoring
+# stack (each becomes a grafana_dashboard-labeled ConfigMap the Grafana sidecar imports).
+GRAFANA_DASHBOARDS_DIR = Path(__file__).parent / "dashboards"
 MTAIL_IMAGE = "ghcr.io/google/mtail:3.0.8"
 MTAIL_METRICS_PORT = 3903
 MTAIL_PROGS_DIR = Path(__file__).parent / "mtail"
@@ -1379,6 +1383,40 @@ def _ceph_dashboard_configmap(name: str, json_str: str) -> ConfigMap:
     )
 
 
+def apply_local_grafana_dashboards() -> None:
+    """Auto-deploy every *.json dashboard dropped in ./dashboards/.
+
+    Each file becomes a ConfigMap labeled grafana_dashboard=1 in the monitoring
+    namespace; the kube-prometheus-stack Grafana sidecar watches for that label and
+    imports/updates the dashboards live (see the grafana.sidecar.dashboards.* settings
+    in deploy_monitoring). Just drop a .json in the folder and re-run — no restart needed.
+    """
+    files = sorted(GRAFANA_DASHBOARDS_DIR.glob("*.json"))
+    if not files:
+        log.info(f"No custom dashboards in {GRAFANA_DASHBOARDS_DIR}, skipping.")
+        return
+
+    log.info(f"Deploying {len(files)} custom Grafana dashboard(s) from {GRAFANA_DASHBOARDS_DIR}...")
+    for path in files:
+        # ConfigMap names must be DNS-1123 labels; slugify the file stem.
+        slug = re.sub(r"[^a-z0-9-]+", "-", path.stem.lower()).strip("-") or "dashboard"
+        _apply(
+            ConfigMap(
+                {
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {
+                        "name": f"custom-dashboard-{slug}",
+                        "namespace": MONITORING_NAMESPACE,
+                        "labels": {"grafana_dashboard": "1"},
+                    },
+                    "data": {path.name: path.read_text()},
+                }
+            )
+        )
+        log.info(f"  [green]✓ {path.name}[/]", extra={"markup": True})
+
+
 def deploy_monitoring() -> None:
     log.info("Deploying kube-prometheus-stack...")
 
@@ -1468,6 +1506,8 @@ def deploy_monitoring() -> None:
     for dash in CEPH_DASHBOARDS:
         body = _fetch_ceph_dashboard(dash)
         _apply(_ceph_dashboard_configmap(dash, body))
+
+    apply_local_grafana_dashboards()
 
     # The chart uses 'app.kubernetes.io/name=grafana' rather than 'app=grafana',
     # so _wait_for_app_pods (keyed on 'app') won't find these pods. Wait on
