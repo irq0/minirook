@@ -1613,15 +1613,19 @@ def install_k6_operator() -> None:
     ])
     run_cmd(["helm", "repo", "update", "grafana"])
 
-    # Helm's --create-namespace refuses to adopt a namespace it didn't create,
-    # so leave K6_OPERATOR_NAMESPACE for Helm. K6_NAMESPACE holds workload
-    # resources only, so we can manage it ourselves.
+    # The k6-operator chart templates its own Namespace resource (namespace.create,
+    # default true). That fights a pre-existing namespace two ways: --create-namespace
+    # errors with "already exists", and even without it the chart can't adopt a
+    # namespace lacking Helm ownership metadata. So disable the chart's namespace
+    # creation and manage both namespaces ourselves via the idempotent _apply, which
+    # adopts a pre-existing namespace regardless of ownership labels.
+    for ns in (K6_OPERATOR_NAMESPACE, K6_NAMESPACE):
     _apply(
         Namespace(
             {
                 "apiVersion": "v1",
                 "kind": "Namespace",
-                "metadata": {"name": K6_NAMESPACE},
+                    "metadata": {"name": ns},
             }
         )
     )
@@ -1631,7 +1635,7 @@ def install_k6_operator() -> None:
         "helm", "upgrade", "--install", "k6-operator",
         "grafana/k6-operator",
         "--namespace", K6_OPERATOR_NAMESPACE,
-        "--create-namespace",
+        "--set", "namespace.create=false",
         "--timeout", "5m",
     ])
 
