@@ -1,4 +1,5 @@
 import base64
+import graphlib
 import json
 import logging
 import os
@@ -8,7 +9,9 @@ import sys
 import tempfile
 import time
 from collections.abc import Callable, Generator
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -28,7 +31,10 @@ from kr8s.objects import (
     Service,
     objects_from_files,
 )
+from rich.console import Console
+from rich.live import Live
 from rich.logging import RichHandler
+from rich.table import Table
 
 
 class K8sResource(Protocol):
@@ -121,8 +127,14 @@ class TestRun(APIObject):
 # ==========================================
 # Logging
 # ==========================================
+# Single shared console so the rollout's live progress view (rich.Live) and the
+# logging output coordinate on the same terminal instead of garbling each other.
+console = Console()
 logging.basicConfig(
-    level="INFO", format="%(message)s", datefmt="[%X]", handlers=[RichHandler(rich_tracebacks=True, show_path=False)]
+    level="INFO",
+    format="%(message)s",
+    datefmt="[%X]",
+    handlers=[RichHandler(console=console, rich_tracebacks=True, show_path=False)],
 )
 log = logging.getLogger("rook-test")
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -178,9 +190,22 @@ K6_S3_BUCKET = "k6-bench"  # shared by all S3-using k6 targets (rgw-native, rgw-
 # ==========================================
 # Utility Functions
 # ==========================================
-def run_cmd(cmd: list[str]) -> None:
+def run_cmd(cmd: list[str], stream: bool = False) -> None:
+    """Run a subprocess. By default output is captured and only surfaced on failure, so
+    commands running under the parallel rollout's live display (helm, kubectl, ...) don't
+    garble it. Pass stream=True for long interactive commands (e.g. `minikube start`) that
+    should render their own progress directly to the console — only safe when no live
+    display is active (see run_dag's pre-live phase)."""
     log.info(f"Executing: {' '.join(cmd)}")
+    if stream:
     subprocess.run(cmd, check=True)
+        return
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        for stream_name, text in (("stdout", result.stdout), ("stderr", result.stderr)):
+            if text and text.strip():
+                log.error(f"{' '.join(cmd[:2])} {stream_name}:\n{text.rstrip()}")
+        raise subprocess.CalledProcessError(result.returncode, cmd, result.stdout, result.stderr)
 
 
 def log_rgw_version() -> None:
@@ -455,9 +480,14 @@ def start_minikube() -> None:
     else:
         driver = "qemu2"
     run_cmd(
-        ["minikube", "start", f"--driver={driver}", "--memory=16384", "--cpus=4", "--disk-size=40g", "--extra-disks=3"]
+        ["minikube", "start", f"--driver={driver}", "--memory=16384", "--cpus=4", "--disk-size=40g", "--extra-disks=3"],
+        stream=True,  # let minikube render its own progress; runs before the live display starts
     )
-    run_cmd(["minikube", "addons", "enable", "ingress"])
+    # Enable ALL addons here, in the single serial root step. `minikube addons enable`
+    # mutates cluster-wide state and is not safe to run concurrently, so keeping every
+    # addon call in start_minikube lets the rest of the rollout run in parallel safely.
+    for addon in ("ingress", "storage-provisioner", "default-storageclass"):
+        run_cmd(["minikube", "addons", "enable", addon])
 
 
 def deploy_rook(ceph_image: str = CEPH_IMAGE) -> None:
@@ -1291,12 +1321,10 @@ def deploy_barbican_native() -> None:
     log.info("[bold green]Barbican deployed.[/bold green]", extra={"markup": True})
 
 
-def deploy_openstack_infra() -> None:
-    log.info("Enabling storage-provisioner and default-storageclass addons...")
-    run_cmd(["minikube", "addons", "enable", "storage-provisioner"])
-    run_cmd(["minikube", "addons", "enable", "default-storageclass"])
-
-    deploy_mariadb()
+# NOTE: MariaDB is deployed directly via deploy_mariadb() from the `mariadb` DAG node
+# in main(); the storage-provisioner / default-storageclass addons it needs are now
+# enabled up front in start_minikube() (all minikube-CLI mutations kept in one serial
+# step so the rest of the rollout can run concurrently).
 
 
 # ==========================================
@@ -2616,6 +2644,229 @@ def run_openstack_smoke_tests(ec2_access: str, ec2_secret: str, key_uuid: str) -
 
 
 # ==========================================
+# Task graph runner (parallel DAG rollout)
+# ==========================================
+# The setup pipeline's independent components (the Ceph track, the OpenStack
+# track, and the monitoring branch) are modelled as a DAG and executed
+# concurrently via graphlib.TopologicalSorter + a thread pool. The work is
+# I/O-bound (kubectl/helm/HTTP waits) and kr8s' sync API is thread-safe (it
+# marshals calls to a background event-loop thread), so threads fit well.
+# Ordering hazards on shared objects (the rook-config-override ConfigMap, the
+# CephObjectStore and CephCluster, and the minikube CLI) are avoided purely by
+# the dependency EDGES declared in main() — no cross-task locking is needed.
+
+Context = dict[str, Any]
+
+_PENDING, _RUNNING, _DONE, _SKIPPED, _FAILED, _BLOCKED = (
+    "pending", "running", "done", "skipped", "failed", "blocked",
+)
+
+
+@dataclass
+class Task:
+    name: str
+    run: Callable[[Context], None]
+    deps: tuple[str, ...] = ()
+    guard: Callable[[], bool] | None = None  # if it returns True, skip run() (idempotency)
+    # Extra attempts after the first, for transient failures. Defaults to 0: the
+    # deploy_* functions already poll with generous _wait_for_* timeouts (the real
+    # transient-tolerance layer) and are idempotent, so an outer retry would mostly
+    # re-run long waits. Bump per-task where a quick external call warrants it.
+    retries: int = 0
+    track: str = ""  # label for grouping in the live view
+    # Tasks that render their own interactive console UI (e.g. minikube start). run_dag
+    # executes these BEFORE starting the live display so the two don't fight. They must
+    # form a dependency prefix (roots) so they can all run first.
+    no_live: bool = False
+    state: str = field(default=_PENDING, init=False)
+    started: float | None = field(default=None, init=False)
+    ended: float | None = field(default=None, init=False)
+    error: BaseException | None = field(default=None, init=False)
+
+    @property
+    def elapsed(self) -> float:
+        if self.started is None:
+            return 0.0
+        return (self.ended or time.time()) - self.started
+
+
+class RolloutError(RuntimeError):
+    def __init__(self, failures: dict[str, BaseException]) -> None:
+        self.failures = failures
+        super().__init__("; ".join(f"{n}: {e}" for n, e in failures.items()))
+
+
+def _task_ranks(tasks: list[Task]) -> dict[str, int]:
+    """Longest-path depth from the roots; nodes at the same rank can run in parallel."""
+    by_name = {t.name: t for t in tasks}
+    memo: dict[str, int] = {}
+
+    def rank(name: str) -> int:
+        if name not in memo:
+            memo[name] = 1 + max((rank(d) for d in by_name[name].deps), default=-1)
+        return memo[name]
+
+    return {t.name: rank(t.name) for t in tasks}
+
+
+def render_dag_ascii(tasks: list[Task]) -> str:
+    """ASCII rendering of the DAG, derived purely from the Task list (never drifts)."""
+    ranks = _task_ranks(tasks)
+    width = max(len(t.name) for t in tasks)
+    lines = ["", "minirook setup — execution DAG  (nodes at the same rank run in parallel)", ""]
+    for r in sorted(set(ranks.values())):
+        members = [t for t in tasks if ranks[t.name] == r]
+        for i, t in enumerate(members):
+            connector = "└─" if i == len(members) - 1 else "├─"
+            prefix = f"rank {r}" if i == 0 else ""
+            deps = ", ".join(t.deps) if t.deps else "(root)"
+            lines.append(f"{prefix:<7} {connector} {t.name:<{width}}  ← {deps}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _render_progress(tasks: list[Task]) -> Table:
+    icons = {
+        _PENDING: "[dim]·[/]", _RUNNING: "[yellow]▶[/]", _DONE: "[green]✓[/]",
+        _SKIPPED: "[blue]↷[/]", _FAILED: "[red]✗[/]", _BLOCKED: "[dim]⊘[/]",
+    }
+    table = Table(title="Rollout progress")
+    table.add_column("")
+    table.add_column("task")
+    table.add_column("track", style="dim")
+    table.add_column("elapsed", justify="right")
+    for t in tasks:
+        secs = f"{t.elapsed:.0f}s" if t.state in (_RUNNING, _DONE, _FAILED) else ""
+        table.add_row(icons.get(t.state, "?"), t.name, t.track, secs)
+    return table
+
+
+def _print_timing_summary(tasks: list[Task], total: float) -> None:
+    table = Table(title=f"Rollout timing  (total {total:.0f}s wall-clock)")
+    table.add_column("task")
+    table.add_column("state")
+    table.add_column("seconds", justify="right")
+    for t in sorted(tasks, key=lambda x: -x.elapsed):
+        table.add_row(t.name, t.state, f"{t.elapsed:.0f}")
+    console.print(table)
+
+
+def _run_one(task: Task, ctx: Context) -> None:
+    """Execute one task body with guard + retries. Runs in a worker thread."""
+    if task.guard is not None:
+        try:
+            if task.guard():
+                task.state = _SKIPPED
+                log.info(f"[blue]↷ {task.name}: already satisfied, skipping[/]", extra={"markup": True})
+                return
+        except Exception:  # noqa: BLE001 — a flaky guard just means "not satisfied, run it"
+            pass
+    attempts = task.retries + 1
+    for attempt in range(1, attempts + 1):
+        try:
+            task.run(ctx)
+            return
+        except Exception as exc:  # noqa: BLE001
+            if attempt >= attempts:
+                raise
+            log.warning(
+                f"[yellow]{task.name}: attempt {attempt}/{attempts} failed ({exc}); retrying[/]",
+                extra={"markup": True},
+            )
+            time.sleep(5)
+
+
+def run_dag(tasks: list[Task], max_workers: int = 8) -> None:
+    """Execute a task DAG concurrently. Fail-fast per branch: on a task failure,
+    in-flight independent tasks finish, dependents are left blocked, and a
+    RolloutError aggregating all failures is raised at the end."""
+    by_name = {t.name: t for t in tasks}
+    console.print(render_dag_ascii(tasks))
+
+    ts: graphlib.TopologicalSorter[str] = graphlib.TopologicalSorter()
+    for t in tasks:
+        ts.add(t.name, *t.deps)
+    ts.prepare()
+
+    ctx: Context = {}
+    failures: dict[str, BaseException] = {}
+    started = time.time()
+
+    def _finish(name: str, exc: BaseException | None) -> None:
+        task = by_name[name]
+        task.ended = time.time()
+        if exc is not None:
+            task.state = _FAILED
+            task.error = exc
+            failures[name] = exc
+            log.error(f"[red]✗ {name} failed: {exc}[/]", extra={"markup": True})
+        elif task.state != _SKIPPED:
+            task.state = _DONE
+        if exc is None:
+            ts.done(name)
+
+    # --- Phase 1 (no live display): run interactive/no_live tasks (e.g. minikube, which
+    # renders its own console progress) inline and serially, before the live display
+    # starts, so the two don't fight. no_live tasks must form a dependency prefix; any
+    # ready live-tasks discovered here are carried into phase 2. ---
+    carried: list[str] = []
+    while ts.is_active() and not failures:
+        ready = list(ts.get_ready())
+        if not ready:
+            break
+        pre = [n for n in ready if by_name[n].no_live]
+        carried.extend(n for n in ready if not by_name[n].no_live)
+        if not pre:
+            break
+        for name in pre:
+            task = by_name[name]
+            task.state = _RUNNING
+            task.started = time.time()
+            exc: BaseException | None = None
+            try:
+                _run_one(task, ctx)
+            except Exception as e:  # noqa: BLE001
+                exc = e
+            _finish(name, exc)
+
+    # --- Phase 2 (live display): everything else runs concurrently. ---
+    def _submit(ex: ThreadPoolExecutor, futs: dict[Future[None], str], names: list[str]) -> None:
+        for name in names:
+            task = by_name[name]
+            task.state = _RUNNING
+            task.started = time.time()
+            futs[ex.submit(_run_one, task, ctx)] = name
+
+    if not failures and (carried or ts.is_active()):
+        with (
+            Live(_render_progress(tasks), console=console, refresh_per_second=4) as live,
+            ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="rollout") as ex,
+        ):
+            futs: dict[Future[None], str] = {}
+            _submit(ex, futs, carried or list(ts.get_ready()))
+            while futs:
+                done, _ = wait(futs, timeout=1, return_when=FIRST_COMPLETED)
+                for fut in done:
+                    name = futs.pop(fut)
+                    _finish(name, fut.exception())
+                # Fail-fast: once anything has failed, stop scheduling new work and
+                # just drain the in-flight (independent) tasks.
+                if not failures and ts.is_active():
+                    _submit(ex, futs, list(ts.get_ready()))
+                live.update(_render_progress(tasks))
+
+    if failures:
+        for t in tasks:
+            if t.state == _PENDING:
+                t.state = _BLOCKED
+        console.print(_render_progress(tasks))
+
+    _print_timing_summary(tasks, time.time() - started)
+    if failures:
+        raise RolloutError(failures)
+
+
+# ==========================================
 # CLI
 # ==========================================
 @click.group(help="Automate Minikube & Rook + OpenStack test environment setup.")
@@ -2656,88 +2907,82 @@ def setup_cmd(image_name: str | None, image_transfer: str, ceph_image: str) -> N
     main(image_name, image_transfer, ceph_image)
 
 
-def main(image_name: str | None, image_transfer: str, ceph_image: str = CEPH_IMAGE) -> None:
-    log.info("[bold magenta]Starting Rook-Ceph Test Environment Setup[/]", extra={"markup": True})
+def build_setup_tasks(
+    image_name: str | None, image_transfer: str, ceph_image: str = CEPH_IMAGE
+) -> list[Task]:
+    """Build the setup DAG. Pure construction with no side effects, so the graph can be
+    rendered/inspected (render_dag_ascii) or validated without running the pipeline."""
 
-    # 1. Minikube
+    # --- Task bodies (each receives the shared Context; see run_dag). Existing
+    # deploy_*/setup_* functions are reused unchanged; these are thin wrappers
+    # that add the idempotency short-circuits and cross-task data hand-off. ---
+
+    def t_minikube(ctx: Context) -> None:
     if is_minikube_running():
-        log.info("Minikube already running, skipping.")
+            log.info("Minikube already running.")
     else:
         start_minikube()
+        kr8s.api()  # initialise the client once minikube's kubeconfig exists
 
-    kr8s.api()
-
-    # 2. Rook + Ceph
+    def t_rook(ctx: Context) -> None:
     if is_rook_deployed() and is_ceph_healthy():
-        log.info("Rook deployed and Ceph healthy, skipping.")
+            log.info("Rook + Ceph already healthy, skipping deploy.")
     else:
         deploy_rook(ceph_image)
         _wait_for_condition("Ceph HEALTH_OK", is_ceph_healthy, timeout=300, interval=10)
-
-    # 3. Custom image
-    if image_name is not None:
-        if image_transfer == "load" or (image_transfer == "auto" and is_local_image(image_name)):
-            log.info(f"Image [bold]{image_name}[/] will be loaded into Minikube from Podman.", extra={"markup": True})
+        if image_name is not None:  # optional custom Ceph image (folded in here so the
+            if image_transfer == "load" or (image_transfer == "auto" and is_local_image(image_name)):  # only CephCluster mutations are serialised before `monitoring`)
+                log.info(f"Loading image [bold]{image_name}[/] into Minikube from Podman.", extra={"markup": True})
             load_image_to_minikube(image_name)
         else:
-            log.info(f"Image [bold]{image_name}[/] will be pulled from a registry by the pods.", extra={"markup": True})
-
+                log.info(f"Image [bold]{image_name}[/] will be pulled by the pods.", extra={"markup": True})
         upgrade_rook_operator(image_name)
         _wait_for_condition("Ceph HEALTH_OK", is_ceph_healthy, timeout=300, interval=10)
 
-    # 4. Object store
-    if is_object_store_ready():
-        log.info("CephObjectStore already Ready, skipping.")
-    else:
+    def t_object_store(ctx: Context) -> None:
         deploy_object_store()
 
-    # 5. Basic S3 smoke test (skip if Keystone already configured)
-    if is_object_store_keystone_configured():
-        log.info("Keystone already configured, skipping basic S3 smoke test.")
-    else:
+    def t_basic_smoke(ctx: Context) -> None:
         with port_forward("rook-ceph-rgw-my-store", "rook-ceph", RGW_LOCAL_PORT, 80):
             run_smoke_tests()
 
-    # 6. OpenStack namespace
-    if is_namespace_exists("openstack"):
-        log.info("Namespace 'openstack' exists, skipping.")
-    else:
+    def t_os_ns(ctx: Context) -> None:
         setup_openstack_namespace()
 
-    # 7. OpenStack infra (addons + MariaDB)
-    if is_mariadb_deployed():
-        log.info("MariaDB already deployed, skipping infra step.")
-    else:
-        deploy_openstack_infra()
+    def t_mariadb(ctx: Context) -> None:
+        deploy_mariadb()
 
-    # 8. Keystone (native)
-    if is_keystone_native_deployed():
-        log.info("Keystone already deployed, skipping.")
-    else:
+    def t_keystone(ctx: Context) -> None:
         deploy_keystone_native()
 
-    # 9. Barbican (native)
-    if is_barbican_native_deployed():
-        log.info("Barbican already deployed, skipping.")
-    else:
+    def t_barbican(ctx: Context) -> None:
         deploy_barbican_native()
 
-    # 10. Configure Keystone + Barbican (always runs, idempotent, needed for creds)
+    def t_setup_ks(ctx: Context) -> None:
+        with port_forward("keystone-api", "openstack", KEYSTONE_LOCAL_PORT, 5000):
+            ctx["ks_result"] = setup_keystone(f"http://localhost:{KEYSTONE_LOCAL_PORT}")
+
+    def t_setup_barb(ctx: Context) -> None:
     with (
         port_forward("keystone-api", "openstack", KEYSTONE_LOCAL_PORT, 5000),
         port_forward("barbican-api", "openstack", BARBICAN_LOCAL_PORT, 9311),
     ):
-        ks_result = setup_keystone(f"http://localhost:{KEYSTONE_LOCAL_PORT}")
-        key_uuid = setup_barbican(
+            ctx["key_uuid"] = setup_barbican(
             keystone_url=f"http://localhost:{KEYSTONE_LOCAL_PORT}",
-            rgwcrypt_user_id=ks_result["rgwcrypt_user_id"],
+                rgwcrypt_user_id=ctx["ks_result"]["rgwcrypt_user_id"],
             barbican_url=f"http://localhost:{BARBICAN_LOCAL_PORT}",
         )
 
-    # 11. Reconfigure ObjectStore for Keystone (always re-apply, idempotent)
+    def t_monitoring(ctx: Context) -> None:
+        deploy_monitoring()
+
+    def t_mtail(ctx: Context) -> None:
+        deploy_mtail()
+
+    def t_reconfigure(ctx: Context) -> None:
     reconfigure_object_store_for_keystone(KEYSTONE_CLUSTER_URL)
 
-    # 12. OpenStack smoke tests
+    def t_openstack_smoke(ctx: Context) -> None:
     with port_forward("rook-ceph-rgw-my-store", "rook-ceph", RGW_LOCAL_PORT, 80):
         _wait_for_condition(
             "RGW API to be reachable",
@@ -2745,8 +2990,42 @@ def main(image_name: str | None, image_transfer: str, ceph_image: str = CEPH_IMA
             timeout=60,
             interval=3,
         )
-        run_openstack_smoke_tests(ks_result["ec2_access"], ks_result["ec2_secret"], key_uuid)
+            run_openstack_smoke_tests(
+                ctx["ks_result"]["ec2_access"], ctx["ks_result"]["ec2_secret"], ctx["key_uuid"]
+            )
 
+    # --- The DAG. Edges are the single source of truth for ordering; the ASCII
+    # graph and the concurrency both derive from `deps`. ---
+    tasks = [
+        Task("minikube", t_minikube, track="core", no_live=True),
+        # Ceph track
+        Task("rook", t_rook, deps=("minikube",), track="ceph"),
+        Task("object_store", t_object_store, deps=("rook",), guard=is_object_store_ready, track="ceph"),
+        # basic S3 smoke is skipped once the store is Keystone-configured (matches prior behaviour)
+        Task("basic_smoke", t_basic_smoke, deps=("object_store",),
+             guard=is_object_store_keystone_configured, track="ceph"),
+        # OpenStack track
+        Task("os_ns", t_os_ns, deps=("minikube",),
+             guard=lambda: is_namespace_exists("openstack"), track="openstack"),
+        Task("mariadb", t_mariadb, deps=("os_ns",), guard=is_mariadb_deployed, track="openstack"),
+        Task("keystone", t_keystone, deps=("mariadb",), guard=is_keystone_native_deployed, track="openstack"),
+        Task("barbican", t_barbican, deps=("mariadb",), guard=is_barbican_native_deployed, track="openstack"),
+        Task("setup_ks", t_setup_ks, deps=("keystone",), track="openstack"),
+        Task("setup_barb", t_setup_barb, deps=("setup_ks", "barbican"), track="openstack"),
+        # Monitoring branch (needs the CephCluster to exist)
+        Task("monitoring", t_monitoring, deps=("rook",), guard=is_monitoring_deployed, track="monitoring"),
+        Task("mtail", t_mtail, deps=("monitoring",), guard=is_mtail_deployed, track="monitoring"),
+        # Join + final verification
+        Task("reconfigure", t_reconfigure, deps=("object_store", "setup_ks", "setup_barb"), track="join"),
+        Task("openstack_smoke", t_openstack_smoke, deps=("reconfigure",), track="join"),
+    ]
+
+    return tasks
+
+
+def main(image_name: str | None, image_transfer: str, ceph_image: str = CEPH_IMAGE) -> None:
+    log.info("[bold magenta]Starting Rook-Ceph Test Environment Setup (parallel DAG)[/]", extra={"markup": True})
+    run_dag(build_setup_tasks(image_name, image_transfer, ceph_image))
     log.info("[bold green]All done![/bold green]", extra={"markup": True})
 
 
