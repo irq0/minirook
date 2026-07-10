@@ -465,7 +465,25 @@ def deploy_rook(ceph_image: str = CEPH_IMAGE) -> None:
 
     apply_remote_yaml(f"{base_url}/crds.yaml")
     apply_remote_yaml(f"{base_url}/common.yaml")
-    apply_remote_yaml(f"{base_url}/operator.yaml")
+
+    def _disable_csi(resource: APIObject) -> None:
+        # This rig uses Ceph only for the object store (RGW/S3) — no RBD/CephFS PVCs —
+        # so disable CSI entirely (drops ~5 unused pods). All three keys are required:
+        # ROOK_USE_CSI_OPERATOR defaults true in Rook 1.19, and while true the operator
+        # unconditionally reconciles the ceph-CSI-operator CRs (OperatorConfig /
+        # CephConnection in csi.ceph.io/v1) — CRDs we don't install (they live in the
+        # separate csi-operator.yaml) — which fails reconciliation even with the RBD and
+        # CephFS drivers turned off.
+        if (
+            resource.raw.get("kind") == "ConfigMap"
+            and resource.raw.get("metadata", {}).get("name") == "rook-ceph-operator-config"
+        ):
+            data = resource.raw.setdefault("data", {})
+            data["ROOK_USE_CSI_OPERATOR"] = "false"
+            data["ROOK_CSI_ENABLE_RBD"] = "false"
+            data["ROOK_CSI_ENABLE_CEPHFS"] = "false"
+
+    apply_remote_yaml(f"{base_url}/operator.yaml", transform=_disable_csi)
 
     def _operator_ready() -> bool:
         pods = list(kr8s.get("pods", namespace="rook-ceph", label_selector={"app": "rook-ceph-operator"}))
