@@ -17,7 +17,17 @@ import click
 import httpx
 import kr8s
 from botocore.exceptions import ClientError
-from kr8s.objects import APIObject, ConfigMap, Deployment, Ingress, Namespace, Secret, Service, objects_from_files
+from kr8s.objects import (
+    APIObject,
+    ConfigMap,
+    Deployment,
+    Ingress,
+    Namespace,
+    PersistentVolumeClaim,
+    Secret,
+    Service,
+    objects_from_files,
+)
 from rich.logging import RichHandler
 
 
@@ -132,6 +142,13 @@ _KOLLA_ARCH_SUFFIX = "-aarch64" if platform.machine() in ("arm64", "aarch64") el
 KEYSTONE_IMAGE = f"quay.io/openstack.kolla/keystone:2025.1-debian-bookworm{_KOLLA_ARCH_SUFFIX}"
 BARBICAN_IMAGE = f"quay.io/openstack.kolla/barbican-api:2025.1-debian-bookworm{_KOLLA_ARCH_SUFFIX}"
 
+# Rook's default dataDirHostPath (/var/lib/rook) lives on minikube's tmpfs root and
+# is wiped by `minikube stop/start`. That destroys the mon store (cephx auth DB,
+# osdmap) while the OSD data on the persistent --extra-disks survives, leaving the
+# mon and OSDs with mismatched cephx keys (handle_auth_bad_method) after every
+# restart. /data is one of the few host paths minikube persists across restarts.
+ROOK_DATA_DIR_HOST_PATH = "/data/rook"
+
 MONITORING_NAMESPACE = "monitoring"
 PROMETHEUS_LOCAL_PORT = 9090
 GRAFANA_LOCAL_PORT = 3000
@@ -180,7 +197,7 @@ def is_local_image(image_name: str) -> bool:
     return result.returncode == 0
 
 
-def apply_remote_yaml(url: str) -> None:
+def apply_remote_yaml(url: str, transform: Callable[[APIObject], None] | None = None) -> None:
     file_name = url.split("/")[-1]
     log.info(f"Downloading and applying {file_name}...")
 
@@ -193,6 +210,8 @@ def apply_remote_yaml(url: str) -> None:
 
     try:
         for resource in objects_from_files(tf_path):
+            if transform is not None:
+                transform(resource)
             if resource.exists():
                 resource.patch(resource.raw)
             else:
@@ -444,7 +463,21 @@ def deploy_rook() -> None:
         )
 
     _wait_for_condition("Operator pods to be Ready", _operator_ready, timeout=120, interval=2)
-    apply_remote_yaml(f"{base_url}/cluster-test.yaml")
+
+    def _persist_datadir(resource: APIObject) -> None:
+        # Point a NEW CephCluster at a minikube-persistent host path so the mon store
+        # survives `minikube stop/start` (see ROOK_DATA_DIR_HOST_PATH). dataDirHostPath
+        # is immutable once the cluster exists, so on an existing cluster we must drop
+        # the field entirely (a merge patch omitting it leaves the live value untouched)
+        # rather than try to change it, which the API server rejects.
+        if resource.raw.get("kind") != "CephCluster":
+            return
+        if resource.exists():
+            resource.raw.get("spec", {}).pop("dataDirHostPath", None)
+        else:
+            resource.raw.setdefault("spec", {})["dataDirHostPath"] = ROOK_DATA_DIR_HOST_PATH
+
+    apply_remote_yaml(f"{base_url}/cluster-test.yaml", transform=_persist_datadir)
 
 
 def load_image_to_minikube(image_name: str) -> None:
@@ -697,6 +730,26 @@ def deploy_mariadb() -> None:
     log.info("Deploying MariaDB...")
 
     probe_cmd = ["mysqladmin", "ping", "-h", "127.0.0.1", "-u", "root", "-ppassword"]
+
+    # Persist /var/lib/mysql on a PVC. The minikube-hostpath provisioner stores PVC
+    # data under /tmp/hostpath-provisioner, one of the few paths minikube keeps across
+    # `minikube stop/start`. Without this, MariaDB runs on the container's ephemeral
+    # writable layer and loses every database (keystone, barbican, ...) on restart.
+    _apply(
+        PersistentVolumeClaim(
+            {
+                "apiVersion": "v1",
+                "kind": "PersistentVolumeClaim",
+                "metadata": {"name": "mariadb-data", "namespace": "openstack"},
+                "spec": {
+                    "accessModes": ["ReadWriteOnce"],
+                    "storageClassName": "general",
+                    "resources": {"requests": {"storage": "5Gi"}},
+                },
+            }
+        )
+    )
+
     _apply(
         Deployment(
             {
@@ -710,6 +763,9 @@ def deploy_mariadb() -> None:
                 "spec": {
                     "replicas": 1,
                     "selector": {"matchLabels": {"app": "mariadb"}},
+                    # RWO volume: the old pod must release the PVC before the new one
+                    # mounts it, so a rolling update would deadlock. Recreate instead.
+                    "strategy": {"type": "Recreate"},
                     "template": {
                         "metadata": {"labels": {"app": "mariadb"}},
                         "spec": {
@@ -733,8 +789,14 @@ def deploy_mariadb() -> None:
                                         "requests": {"memory": "256Mi"},
                                         "limits": {"memory": "512Mi"},
                                     },
+                                    "volumeMounts": [
+                                        {"name": "data", "mountPath": "/var/lib/mysql"},
+                                    ],
                                 }
-                            ]
+                            ],
+                            "volumes": [
+                                {"name": "data", "persistentVolumeClaim": {"claimName": "mariadb-data"}},
+                            ],
                         },
                     },
                 },
