@@ -441,7 +441,15 @@ def is_mtail_deployed() -> bool:
 # ==========================================
 def start_minikube() -> None:
     log.info("Starting Minikube VM according to official Rook dev guidelines...")
-    run_cmd(["minikube", "start", "--driver=vfkit", "--memory=16384", "--cpus=4", "--disk-size=40g", "--extra-disks=3"])
+    # vfkit is the native macOS hypervisor driver; qemu2 is used on Linux. Both
+    # support --extra-disks (raw block devices) needed for the Ceph OSDs.
+    if platform.system() == "Darwin":
+        driver = "vfkit"
+    else:
+        driver = "qemu2"
+    run_cmd(
+        ["minikube", "start", f"--driver={driver}", "--memory=16384", "--cpus=4", "--disk-size=40g", "--extra-disks=3"]
+    )
     run_cmd(["minikube", "addons", "enable", "ingress"])
 
 
