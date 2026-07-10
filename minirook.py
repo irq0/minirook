@@ -149,10 +149,17 @@ BARBICAN_IMAGE = f"quay.io/openstack.kolla/barbican-api:2025.1-debian-bookworm{_
 # restart. /data is one of the few host paths minikube persists across restarts.
 ROOK_DATA_DIR_HOST_PATH = "/data/rook"
 
+# Default Ceph image for the initial CephCluster. `v19` is Ceph's floating tag for the
+# Squid major (always the newest Squid point release). We override the upstream
+# cluster-test.yaml image, which floats to the newest major (e.g. Tentacle v20) and can
+# resolve to v20.2.0 — avoid it (read-affinity data-corruption bug). Override via
+# `setup --ceph-image` (e.g. quay.io/ceph/ceph:v19.2.4, or v20.2.1+ for Tentacle).
+CEPH_IMAGE = "quay.io/ceph/ceph:v19"
+
 MONITORING_NAMESPACE = "monitoring"
 PROMETHEUS_LOCAL_PORT = 9090
 GRAFANA_LOCAL_PORT = 3000
-CEPH_DASHBOARD_TAG = "v19.2.0"
+CEPH_DASHBOARD_TAG = "v19.2.4"
 CEPH_DASHBOARDS = ("ceph-cluster-advanced", "radosgw-overview", "radosgw-detail")
 MTAIL_IMAGE = "ghcr.io/google/mtail:3.0.8"
 MTAIL_METRICS_PORT = 3903
@@ -453,8 +460,8 @@ def start_minikube() -> None:
     run_cmd(["minikube", "addons", "enable", "ingress"])
 
 
-def deploy_rook() -> None:
-    base_url = "https://raw.githubusercontent.com/rook/rook/release-1.15/deploy/examples"
+def deploy_rook(ceph_image: str = CEPH_IMAGE) -> None:
+    base_url = "https://raw.githubusercontent.com/rook/rook/release-1.19/deploy/examples"
 
     apply_remote_yaml(f"{base_url}/crds.yaml")
     apply_remote_yaml(f"{base_url}/common.yaml")
@@ -472,20 +479,27 @@ def deploy_rook() -> None:
 
     _wait_for_condition("Operator pods to be Ready", _operator_ready, timeout=120, interval=2)
 
-    def _persist_datadir(resource: APIObject) -> None:
-        # Point a NEW CephCluster at a minikube-persistent host path so the mon store
-        # survives `minikube stop/start` (see ROOK_DATA_DIR_HOST_PATH). dataDirHostPath
-        # is immutable once the cluster exists, so on an existing cluster we must drop
-        # the field entirely (a merge patch omitting it leaves the live value untouched)
-        # rather than try to change it, which the API server rejects.
+    def _customize_cluster(resource: APIObject) -> None:
+        # Customize the CephCluster before it is applied. Two overrides:
+        #  - cephVersion.image: pin our chosen image (default: latest Squid) on both
+        #    create and re-apply, so we never inherit cluster-test.yaml's float to the
+        #    newest major (e.g. Tentacle v20) — which would also silently patch an
+        #    existing cluster onto a new major on the next `setup` run.
+        #  - dataDirHostPath: a minikube-persistent path so the mon store survives
+        #    `minikube stop/start` (see ROOK_DATA_DIR_HOST_PATH). This field is immutable
+        #    once the cluster exists, so set it only on create; on an existing cluster
+        #    drop it so the merge patch leaves the live value untouched (the API server
+        #    rejects an attempt to change it).
         if resource.raw.get("kind") != "CephCluster":
             return
+        spec = resource.raw.setdefault("spec", {})
+        spec.setdefault("cephVersion", {})["image"] = ceph_image
         if resource.exists():
-            resource.raw.get("spec", {}).pop("dataDirHostPath", None)
+            spec.pop("dataDirHostPath", None)
         else:
-            resource.raw.setdefault("spec", {})["dataDirHostPath"] = ROOK_DATA_DIR_HOST_PATH
+            spec["dataDirHostPath"] = ROOK_DATA_DIR_HOST_PATH
 
-    apply_remote_yaml(f"{base_url}/cluster-test.yaml", transform=_persist_datadir)
+    apply_remote_yaml(f"{base_url}/cluster-test.yaml", transform=_customize_cluster)
 
 
 def load_image_to_minikube(image_name: str) -> None:
@@ -2605,16 +2619,26 @@ def cli() -> None:
         "'remote': always let pods pull the image from a registry."
     ),
 )
-def setup_cmd(image_name: str | None, image_transfer: str) -> None:
+@click.option(
+    "--ceph-image",
+    default=CEPH_IMAGE,
+    show_default=True,
+    help=(
+        "Ceph container image for the initial CephCluster deploy. "
+        "Defaults to the latest Squid release. Pass e.g. quay.io/ceph/ceph:v19.2.4 to pin, "
+        "or quay.io/ceph/ceph:v20.2.1 (or newer) for Tentacle."
+    ),
+)
+def setup_cmd(image_name: str | None, image_transfer: str, ceph_image: str) -> None:
     """
     IMAGE_NAME: Optional container image to use for Ceph daemons.
     If provided, the image will be loaded and configured.
     If omitted, the stock image is used.
     """
-    main(image_name, image_transfer)
+    main(image_name, image_transfer, ceph_image)
 
 
-def main(image_name: str | None, image_transfer: str) -> None:
+def main(image_name: str | None, image_transfer: str, ceph_image: str = CEPH_IMAGE) -> None:
     log.info("[bold magenta]Starting Rook-Ceph Test Environment Setup[/]", extra={"markup": True})
 
     # 1. Minikube
@@ -2629,7 +2653,7 @@ def main(image_name: str | None, image_transfer: str) -> None:
     if is_rook_deployed() and is_ceph_healthy():
         log.info("Rook deployed and Ceph healthy, skipping.")
     else:
-        deploy_rook()
+        deploy_rook(ceph_image)
         _wait_for_condition("Ceph HEALTH_OK", is_ceph_healthy, timeout=300, interval=10)
 
     # 3. Custom image
