@@ -202,7 +202,7 @@ def run_cmd(cmd: list[str], stream: bool = False) -> None:
     display is active (see run_dag's pre-live phase)."""
     log.info(f"Executing: {' '.join(cmd)}")
     if stream:
-    subprocess.run(cmd, check=True)
+        subprocess.run(cmd, check=True)
         return
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
@@ -1720,15 +1720,15 @@ def install_k6_operator() -> None:
     # creation and manage both namespaces ourselves via the idempotent _apply, which
     # adopts a pre-existing namespace regardless of ownership labels.
     for ns in (K6_OPERATOR_NAMESPACE, K6_NAMESPACE):
-    _apply(
-        Namespace(
-            {
-                "apiVersion": "v1",
-                "kind": "Namespace",
+        _apply(
+            Namespace(
+                {
+                    "apiVersion": "v1",
+                    "kind": "Namespace",
                     "metadata": {"name": ns},
-            }
+                }
+            )
         )
-    )
 
     log.info(f"Installing k6-operator into {K6_OPERATOR_NAMESPACE}...")
     run_cmd([
@@ -2958,26 +2958,28 @@ def build_setup_tasks(
     # that add the idempotency short-circuits and cross-task data hand-off. ---
 
     def t_minikube(ctx: Context) -> None:
-    if is_minikube_running():
+        if is_minikube_running():
             log.info("Minikube already running.")
-    else:
-        start_minikube()
-        kr8s.api()  # initialise the client once minikube's kubeconfig exists
+        else:
+            start_minikube()
+            kr8s.api()  # initialise the client once minikube's kubeconfig exists
 
     def t_rook(ctx: Context) -> None:
-    if is_rook_deployed() and is_ceph_healthy():
+        # optional custom Ceph image (folded in here so the only CephCluster
+        # mutations are serialised before `monitoring`)
+        if is_rook_deployed() and is_ceph_healthy():
             log.info("Rook + Ceph already healthy, skipping deploy.")
-    else:
-        deploy_rook(ceph_image)
-        _wait_for_condition("Ceph HEALTH_OK", is_ceph_healthy, timeout=300, interval=10)
-        if image_name is not None:  # optional custom Ceph image (folded in here so the
-            if image_transfer == "load" or (image_transfer == "auto" and is_local_image(image_name)):  # only CephCluster mutations are serialised before `monitoring`)
-                log.info(f"Loading image [bold]{image_name}[/] into Minikube from Podman.", extra={"markup": True})
-            load_image_to_minikube(image_name)
         else:
-                log.info(f"Image [bold]{image_name}[/] will be pulled by the pods.", extra={"markup": True})
-        upgrade_rook_operator(image_name)
-        _wait_for_condition("Ceph HEALTH_OK", is_ceph_healthy, timeout=300, interval=10)
+            deploy_rook(ceph_image)
+            _wait_for_condition("Ceph HEALTH_OK", is_ceph_healthy, timeout=300, interval=10)
+            if image_name is not None:
+                if image_transfer == "load" or (image_transfer == "auto" and is_local_image(image_name)):
+                    log.info(f"Loading image [bold]{image_name}[/] into Minikube from Podman.", extra={"markup": True})
+                    load_image_to_minikube(image_name)
+                else:
+                    log.info(f"Image [bold]{image_name}[/] will be pulled by the pods.", extra={"markup": True})
+                upgrade_rook_operator(image_name)
+                _wait_for_condition("Ceph HEALTH_OK", is_ceph_healthy, timeout=300, interval=10)
 
     def t_object_store(ctx: Context) -> None:
         deploy_object_store()
@@ -3003,15 +3005,15 @@ def build_setup_tasks(
             ctx["ks_result"] = setup_keystone(f"http://localhost:{KEYSTONE_LOCAL_PORT}")
 
     def t_setup_barb(ctx: Context) -> None:
-    with (
-        port_forward("keystone-api", "openstack", KEYSTONE_LOCAL_PORT, 5000),
-        port_forward("barbican-api", "openstack", BARBICAN_LOCAL_PORT, 9311),
-    ):
+        with (
+            port_forward("keystone-api", "openstack", KEYSTONE_LOCAL_PORT, 5000),
+            port_forward("barbican-api", "openstack", BARBICAN_LOCAL_PORT, 9311),
+        ):
             ctx["key_uuid"] = setup_barbican(
-            keystone_url=f"http://localhost:{KEYSTONE_LOCAL_PORT}",
+                keystone_url=f"http://localhost:{KEYSTONE_LOCAL_PORT}",
                 rgwcrypt_user_id=ctx["ks_result"]["rgwcrypt_user_id"],
-            barbican_url=f"http://localhost:{BARBICAN_LOCAL_PORT}",
-        )
+                barbican_url=f"http://localhost:{BARBICAN_LOCAL_PORT}",
+            )
 
     def t_monitoring(ctx: Context) -> None:
         deploy_monitoring()
@@ -3020,16 +3022,16 @@ def build_setup_tasks(
         deploy_mtail()
 
     def t_reconfigure(ctx: Context) -> None:
-    reconfigure_object_store_for_keystone(KEYSTONE_CLUSTER_URL)
+        reconfigure_object_store_for_keystone(KEYSTONE_CLUSTER_URL)
 
     def t_openstack_smoke(ctx: Context) -> None:
-    with port_forward("rook-ceph-rgw-my-store", "rook-ceph", RGW_LOCAL_PORT, 80):
-        _wait_for_condition(
-            "RGW API to be reachable",
-            lambda: httpx.get(f"http://localhost:{RGW_LOCAL_PORT}").status_code in (200, 403),
-            timeout=60,
-            interval=3,
-        )
+        with port_forward("rook-ceph-rgw-my-store", "rook-ceph", RGW_LOCAL_PORT, 80):
+            _wait_for_condition(
+                "RGW API to be reachable",
+                lambda: httpx.get(f"http://localhost:{RGW_LOCAL_PORT}").status_code in (200, 403),
+                timeout=60,
+                interval=3,
+            )
             run_openstack_smoke_tests(
                 ctx["ks_result"]["ec2_access"], ctx["ks_result"]["ec2_secret"], ctx["key_uuid"]
             )
