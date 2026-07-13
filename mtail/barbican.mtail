@@ -1,0 +1,31 @@
+counter barbican_requests_total by method, route, status
+counter barbican_response_bytes_total by method, route, status
+histogram barbican_request_latency_seconds buckets 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 by method, route, status
+
+text route
+
+# Same uwsgi access-line shape as kolla-keystone. Scoped to barbican paths
+# (`/v1...` and the `/` readiness probe) so we don't double-count keystone's
+# access lines (every mtail program runs against every tailed line).
+/\[pid: \d+\|app: \d+\|req: \d+\/\d+\] \S+ \(\) \{\d+ vars in \d+ bytes\} \[[^\]]+\] (?P<method>\S+) (?P<path>\/v1(?:\/\S*)?|\/) =(?:>|\\u003e) generated (?P<bytes>\d+) bytes in (?P<latency>\d+) msecs \(HTTP\/1\.1 (?P<status>\d+)\)/ {
+  route = "other"
+  # RGW SSE-KMS hot path — every encrypted PUT/GET hits /v1/secrets/{uuid}/payload.
+  $path =~ /^\/v1\/secrets\/[^\/]+\/payload$/ {
+    route = "/v1/secrets/{uuid}/payload"
+  }
+  $path =~ /^\/v1\/secrets\/[^\/]+\/acl$/ {
+    route = "/v1/secrets/{uuid}/acl"
+  }
+  $path =~ /^\/v1\/secrets\/[^\/]+$/ {
+    route = "/v1/secrets/{uuid}"
+  }
+  $path =~ /^\/v1\/secrets(\?.*)?$/ {
+    route = "/v1/secrets"
+  }
+  $path =~ /^\/$/ {
+    route = "/"
+  }
+  barbican_requests_total[$method][route][$status]++
+  barbican_response_bytes_total[$method][route][$status] += $bytes
+  barbican_request_latency_seconds[$method][route][$status] = float($latency) / 1000.0
+}

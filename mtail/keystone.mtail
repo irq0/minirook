@@ -1,0 +1,57 @@
+counter keystone_requests_total by method, route, status
+counter keystone_response_bytes_total by method, route, status
+histogram keystone_request_latency_seconds buckets 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 by method, route, status
+
+text route
+
+# kolla-keystone runs under uwsgi which emits one access line per request:
+#   [pid: N|app: M|req: R/T] <ip> () {N vars in M bytes} [<date>] METHOD /path \
+#   => generated N bytes in M msecs (HTTP/1.1 STATUS) ...
+# Docker's json-file log driver escapes `>` as `>`, so we match either.
+# Scoped to keystone paths (`/v3...`) so we don't accidentally match the
+# uwsgi access lines from the barbican container (both programs run against
+# every tailed line, regardless of source file).
+/\[pid: \d+\|app: \d+\|req: \d+\/\d+\] \S+ \(\) \{\d+ vars in \d+ bytes\} \[[^\]]+\] (?P<method>\S+) (?P<path>\/v3(?:\/\S*)?) =(?:>|\\u003e) generated (?P<bytes>\d+) bytes in (?P<latency>\d+) msecs \(HTTP\/1\.1 (?P<status>\d+)\)/ {
+  route = "other"
+  # `(?:\?.*)?` tolerates optional query strings (kolla logs the raw URI).
+  # Anchored, mutually-exclusive routes — order between blocks is irrelevant.
+  $path =~ /^\/v3\/auth\/tokens(?:\?.*)?$/ {
+    route = "/v3/auth/tokens"
+  }
+  $path =~ /^\/v3\/s3tokens(?:\?.*)?$/ {
+    route = "/v3/s3tokens"
+  }
+  $path =~ /^\/v3\/users\/[^\/?]+\/credentials\/OS-EC2\/[^\/?]+(?:\?.*)?$/ {
+    route = "/v3/users/{id}/credentials/OS-EC2/{id}"
+  }
+  $path =~ /^\/v3\/users\/[^\/?]+\/credentials\/OS-EC2(?:\?.*)?$/ {
+    route = "/v3/users/{id}/credentials/OS-EC2"
+  }
+  $path =~ /^\/v3\/users\/[^\/?]+(?:\?.*)?$/ {
+    route = "/v3/users/{id}"
+  }
+  $path =~ /^\/v3\/users(?:\?.*)?$/ {
+    route = "/v3/users"
+  }
+  $path =~ /^\/v3\/projects\/[^\/?]+\/users\/[^\/?]+\/roles\/[^\/?]+(?:\?.*)?$/ {
+    route = "/v3/projects/{id}/users/{id}/roles/{id}"
+  }
+  $path =~ /^\/v3\/projects\/[^\/?]+(?:\?.*)?$/ {
+    route = "/v3/projects/{id}"
+  }
+  $path =~ /^\/v3\/projects(?:\?.*)?$/ {
+    route = "/v3/projects"
+  }
+  $path =~ /^\/v3\/roles\/[^\/?]+(?:\?.*)?$/ {
+    route = "/v3/roles/{id}"
+  }
+  $path =~ /^\/v3\/roles(?:\?.*)?$/ {
+    route = "/v3/roles"
+  }
+  $path =~ /^\/v3(?:\?.*)?$/ {
+    route = "/v3"
+  }
+  keystone_requests_total[$method][route][$status]++
+  keystone_response_bytes_total[$method][route][$status] += $bytes
+  keystone_request_latency_seconds[$method][route][$status] = float($latency) / 1000.0
+}
