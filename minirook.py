@@ -455,8 +455,18 @@ def is_barbican_native_deployed() -> bool:
     return _deployment_ready("barbican-api", "openstack")
 
 
-def is_monitoring_deployed() -> bool:
+def is_prom_stack_deployed() -> bool:
     return _deployment_ready("kube-prometheus-stack-grafana", MONITORING_NAMESPACE)
+
+
+def is_rook_monitoring_deployed() -> bool:
+    """Rook v1.15 doesn't auto-create ServiceMonitors, so the presence of the
+    ones we apply is a reliable signal that the integration has been wired up."""
+    try:
+        sms = list(kr8s.get("servicemonitors", "rook-ceph-mgr", namespace="rook-ceph"))
+        return bool(sms)
+    except Exception:
+        return False
 
 
 def is_mtail_deployed() -> bool:
@@ -1389,7 +1399,7 @@ def apply_local_grafana_dashboards() -> None:
     Each file becomes a ConfigMap labeled grafana_dashboard=1 in the monitoring
     namespace; the kube-prometheus-stack Grafana sidecar watches for that label and
     imports/updates the dashboards live (see the grafana.sidecar.dashboards.* settings
-    in deploy_monitoring). Just drop a .json in the folder and re-run — no restart needed.
+    in deploy_prom_stack). Just drop a .json in the folder and re-run — no restart needed.
     """
     files = sorted(GRAFANA_DASHBOARDS_DIR.glob("*.json"))
     if not files:
@@ -1417,7 +1427,10 @@ def apply_local_grafana_dashboards() -> None:
         log.info(f"  [green]✓ {path.name}[/]", extra={"markup": True})
 
 
-def deploy_monitoring() -> None:
+def deploy_prom_stack() -> None:
+    """Install kube-prometheus-stack. Independent of Rook — only needs the K8s
+    API. Registers the monitoring.coreos.com CRDs (PodMonitor, ServiceMonitor)
+    that mtail and `deploy_rook_monitoring` consume."""
     log.info("Deploying kube-prometheus-stack...")
 
     log.info("Adding prometheus-community Helm repository...")
@@ -1486,6 +1499,25 @@ def deploy_monitoring() -> None:
         *set_args,
     ])
 
+    apply_local_grafana_dashboards()
+
+    # The chart uses 'app.kubernetes.io/name=grafana' rather than 'app=grafana',
+    # so _wait_for_app_pods (keyed on 'app') won't find these pods. Wait on
+    # the Deployment readiness instead.
+    _wait_for_condition(
+        "Grafana Deployment to be Ready",
+        lambda: _deployment_ready("kube-prometheus-stack-grafana", MONITORING_NAMESPACE),
+        timeout=600,
+        interval=5,
+    )
+    log.info("[bold green]Prometheus stack deployed.[/bold green]", extra={"markup": True})
+
+
+def deploy_rook_monitoring() -> None:
+    """Wire Rook-Ceph into the Prometheus stack: enable the CephCluster's
+    exporter, apply the ServiceMonitors Rook v1.15 no longer auto-creates, and
+    load the upstream Ceph Grafana dashboards. Requires both the prom stack
+    (for the ServiceMonitor CRD) and a healthy CephCluster."""
     log.info("Enabling Rook monitoring on CephCluster...")
     [cluster] = list(kr8s.get("cephclusters", namespace="rook-ceph"))
     cluster.patch({"spec": {"monitoring": {
@@ -1507,18 +1539,7 @@ def deploy_monitoring() -> None:
         body = _fetch_ceph_dashboard(dash)
         _apply(_ceph_dashboard_configmap(dash, body))
 
-    apply_local_grafana_dashboards()
-
-    # The chart uses 'app.kubernetes.io/name=grafana' rather than 'app=grafana',
-    # so _wait_for_app_pods (keyed on 'app') won't find these pods. Wait on
-    # the Deployment readiness instead.
-    _wait_for_condition(
-        "Grafana Deployment to be Ready",
-        lambda: _deployment_ready("kube-prometheus-stack-grafana", MONITORING_NAMESPACE),
-        timeout=600,
-        interval=5,
-    )
-    log.info("[bold green]Monitoring stack deployed.[/bold green]", extra={"markup": True})
+    log.info("[bold green]Rook monitoring integration applied.[/bold green]", extra={"markup": True})
 
 
 # ==========================================
@@ -1663,7 +1684,7 @@ def deploy_mtail() -> None:
                     "selector": {"matchLabels": {"app": "mtail"}},
                     "podMetricsEndpoints": [
                         # No explicit interval — inherits Prometheus' global
-                        # scrapeInterval (10s, set in deploy_monitoring).
+                        # scrapeInterval (10s, set in deploy_prom_stack).
                         {"port": "metrics"},
                     ],
                 },
@@ -2116,7 +2137,7 @@ def run_k6_scenario(
         {"name": "K6_PROMETHEUS_RW_SERVER_URL", "value": PROMETHEUS_RW_URL},
         # Emit trend metrics as Prometheus native histograms instead of
         # pre-aggregated p95/p99/etc series. Requires Prometheus to be started
-        # with --enable-feature=native-histograms (set in deploy_monitoring).
+        # with --enable-feature=native-histograms (set in deploy_prom_stack).
         {"name": "K6_PROMETHEUS_RW_TREND_AS_NATIVE_HISTOGRAM", "value": "true"},
     ]
     script_file: str
@@ -3015,11 +3036,17 @@ def build_setup_tasks(
                 barbican_url=f"http://localhost:{BARBICAN_LOCAL_PORT}",
             )
 
-    def t_monitoring(ctx: Context) -> None:
-        deploy_monitoring()
+    def t_prom_stack(ctx: Context) -> None:
+        deploy_prom_stack()
+
+    def t_rook_monitoring(ctx: Context) -> None:
+        deploy_rook_monitoring()
 
     def t_mtail(ctx: Context) -> None:
         deploy_mtail()
+
+    def t_k6(ctx: Context) -> None:
+        install_k6_operator()
 
     def t_reconfigure(ctx: Context) -> None:
         reconfigure_object_store_for_keystone(KEYSTONE_CLUSTER_URL)
@@ -3054,9 +3081,18 @@ def build_setup_tasks(
         Task("barbican", t_barbican, deps=("mariadb",), guard=is_barbican_native_deployed, track="openstack"),
         Task("setup_ks", t_setup_ks, deps=("keystone",), track="openstack"),
         Task("setup_barb", t_setup_barb, deps=("setup_ks", "barbican"), track="openstack"),
-        # Monitoring branch (needs the CephCluster to exist)
-        Task("monitoring", t_monitoring, deps=("rook",), guard=is_monitoring_deployed, track="monitoring"),
-        Task("mtail", t_mtail, deps=("monitoring",), guard=is_mtail_deployed, track="monitoring"),
+        # Monitoring branch. The prom stack install is independent of Rook —
+        # it runs in parallel with the Ceph track. Rook-Ceph gets wired into
+        # the stack once both are up.
+        Task("prom_stack", t_prom_stack, deps=("minikube",),
+             guard=is_prom_stack_deployed, track="monitoring"),
+        Task("rook_monitoring", t_rook_monitoring, deps=("prom_stack", "rook"),
+             guard=is_rook_monitoring_deployed, track="monitoring"),
+        Task("mtail", t_mtail, deps=("prom_stack",), guard=is_mtail_deployed, track="monitoring"),
+        # k6 operator: the dashboard ConfigMap lands in MONITORING_NAMESPACE, so
+        # depend on prom_stack for the namespace to exist. The operator itself
+        # would install without it, but this way the dashboard actually gets picked up.
+        Task("k6", t_k6, deps=("prom_stack",), guard=is_k6_operator_deployed, track="monitoring"),
         # Join + final verification
         Task("reconfigure", t_reconfigure, deps=("object_store", "setup_ks", "setup_barb"), track="join"),
         Task("openstack_smoke", t_openstack_smoke, deps=("reconfigure",), track="join"),
@@ -3268,7 +3304,11 @@ def monitoring_cmd() -> None:
     # Always reconcile: `helm upgrade --install` is idempotent, and reconciling
     # is the only way to apply new flag changes (e.g. enableRemoteWriteReceiver,
     # native-histograms) to an existing deployment without manual intervention.
-    deploy_monitoring()
+    deploy_prom_stack()
+    if is_rook_deployed():
+        deploy_rook_monitoring()
+    else:
+        log.info("Rook not deployed — skipping Rook/Ceph monitoring integration.")
     # Always reconcile the full mtail stack — every _apply is idempotent,
     # the readiness wait is fast when already Ready, and unconditionally
     # re-applying self-heals partial deployments (e.g. a prior run that
@@ -3283,7 +3323,7 @@ def monitoring_cmd() -> None:
 @cli.command("forward-monitoring", help="Port-forward Grafana, Prometheus, and (if present) mtail. Ctrl+C to stop.")
 def forward_monitoring_cmd() -> None:
     kr8s.api()
-    if not is_monitoring_deployed():
+    if not is_prom_stack_deployed():
         log.warning("Monitoring stack is not deployed. Run `monitoring` first.")
         return
     forwards: list[subprocess.Popen[bytes]] = []
@@ -3337,7 +3377,7 @@ def k6_cmd() -> None:
 @k6_cmd.command("install", help="Install k6-operator and import the k6 Grafana dashboard.")
 def k6_install_cmd() -> None:
     kr8s.api()
-    if not is_monitoring_deployed():
+    if not is_prom_stack_deployed():
         log.warning("Monitoring stack is not deployed. Run `monitoring` first to enable Prometheus remote-write.")
         return
     if is_k6_operator_deployed():
